@@ -27,16 +27,8 @@ Requirements
 Highlights
 ==========
 
-- Python <--> DynamoDB type mapping
-- Deep schema definition and validation with ``Onctuous`` (new in 1.8.0)
-- Multi-target transaction (new in 1.6.0)
-- Sub-transactions (new in 1.6.2)
-- Migration engine (new in 1.7.0)
-- Smart conflict detection (new in 1.7.0)
-- Full low-level chunking abstraction for ``scan``, ``query`` and ``get_batch``
+- Python <--> DynamoDB2 type mapping
 - Default values
-- Auto-inc hash_key
-- Framework agnostic
 
 
 Example usage
@@ -75,6 +67,7 @@ First Model
         password = Attribute(STRING, nullable=False, on_save=pwd_context.encrypt, verify=lambda x,y: pwd_context.verify(y,x))
         rank = Attribute(DECIMAL, on_save=lambda x: x+0.1, default=random)
         register_timestamp = Attribute(TIMESTAMP, default=time(), indexed=True)
+
 
 Initial Table creation
 ----------------------
