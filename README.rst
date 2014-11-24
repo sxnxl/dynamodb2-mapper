@@ -64,39 +64,27 @@ First Model
 
 ::
 
-    from dynamodb2_mapper.model import Dynamo2DBModel
-    from dynamodb2_mapper.types import STRING, NUMBER
+    from random import random
+    from dynamodb2_mapper.model import DynamoDB2Model
+    from dynamodb2_mapper.types import STRING, NUMBER, DECIMAL
+    from passlib.apps import custom_app_context as pwd_context
 
     class User(DynamoDB2Model):
         __tablename__ = 'users'
         username = Attribute(STRING, hash_key=True, unique=True)
-        password = Attribute(STRING, nullable=False, on_save=)
-
-
-    class DoomMap(DynamoDBModel):
-        __table__ = u"doom_map"
-        __hash_key__ = u"episode"
-        __range_key__ = u"map"
-        __schema__ = {
-            u"episode": int,
-            u"map": int,
-            u"name": unicode,
-            u"cheats": set,
-        }
-        __defaults__ = {
-            "cheats": set([u"Konami"]),
-        }
-
+        password = Attribute(STRING, nullable=False, on_save=pwd_context.encrypt, verify=lambda x,y: pwd_context.verify(y,x))
+        rank = Attribute(DECIMAL, on_save=lambda x: x+0.1, default=random)
+        register_timestamp = Attribute(TIMESTAMP, default=time(), indexed=True)
 
 Initial Table creation
 ----------------------
 
 ::
 
-    from dynamodb_mapper.model import ConnectionBorg
+    from dynamodb2_mapper.connection import DynamoDB2Connection
 
-    conn = ConnectionBorg()
-    conn.create_table(DoomMap, 10, 10, wait_for_active=True)
+    conn = DynamoDB2Connection()
+    conn.create_table(User, 10, 10, wait_for_active=True)
 
 
 Model Usage
@@ -104,25 +92,35 @@ Model Usage
 
 ::
 
-    e1m1 = DoomMap()
-    e1m1.episode = 1
-    e1m1.map = 1
-    e1m1.name = u"Hangar"
-    e1m1.cheats = set([u"idkfa", u"iddqd", u"idclip"])
-    e1m1.save()
+    import datetime
+    from yourapp.models import User
+
+    new_user = User()
+    new_user.username = u"john_doe"
+    new_user.password = u"secret"
+    new_user.save()
 
 
     # Later on, retrieve that same object from the DB...
-    e1m1 = DoomMap.get(1, 1)
+    existing_user = User(username=u"john_doe")
+    existing_user = User(username__eq=u"john_doe")
+    # or simply
+    existing_user = User(u"john_doe")
 
-    # query all maps of episode 1
-    e1_maps = DoomMap.query(hash_key=1)
+    # rank will be increased by 0.1 and password will be hashed with new random salt
+    existing_user.save() 
 
-    # query all maps of episode 1 with 'map' hash_key > 5
-    from boto.dynamodb.condition import GT
-    e1_maps_after_5 = DoomMap.query(
-        hash_key=1,
-        range_key_condition=GT(5))
+    # create custom methods which will take first argument as attribute's value
+    existing_user.verify(u"secret")
+    True
+
+    existing_user.verify(u"baby")
+    False
+
+    # get users registered in last 10 days
+    ten_days_ago = datetime.date.today() - datetime.timedelta(10)
+    timestamp = ten_days_ago.strftime("%s")
+    users_registered_in_last_ten_days = User().query(register_timestamp__gt=timestamp)
 
 Contribute
 ==========
