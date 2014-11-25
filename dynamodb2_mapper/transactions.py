@@ -3,7 +3,7 @@ from __future__ import absolute_import
 from datetime import datetime
 import logging
 
-from dynamodb_mapper.model import (ConflictError, OverwriteError,
+from dynamodb2_mapper.model import (ConflictError, OverwriteError,
     MaxRetriesExceededError, utc_tz, DynamoDBModel)
 
 

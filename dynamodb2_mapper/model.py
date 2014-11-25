@@ -6,90 +6,35 @@ Released under the GNU LGPL, version 3 or later (see COPYING).
 """
 from __future__ import absolute_import
 
-import json, logging, copy
+import simplejson, logging, copy
 from datetime import datetime, timedelta, tzinfo
+from base64 import b64encode, b64decode
 
-from onctuous.schema import Schema
+from boto.dynamodb2 import connect_to_region as connect_dynamodb2
+from boto.dynamodb2 import import regions as dynamodb_regions2
+from boto.dynamodb2.items import Item
+from boto.dynamodb2.table import Table
+from boto.dynamodb2.fields import HashKey, RangeKey
+from boto.dynamodb2.fields  import AllIndex, GlobalAllIndex
 
-import boto
-from boto.dynamodb.item import Item
 from boto.exception import DynamoDBResponseError
-from boto.dynamodb.exceptions import DynamoDBConditionalCheckFailedError
 
+from boto.dynamodb2.exceptions import (ConditionalCheckFailedException, ItemNotFound,
+                                       QueryError, UnknownFieldError, DynamoDBError,
+                                       ResourceInUseException, UnknownSchemaFieldException,
+                                       ResourceNotFoundError, ValidationException)
+
+from dynamodb2_mapper.types import (BINARY, BINARY_SET, BOOLEAN, FILTER_OPERATORS,
+                                    JSON_TYPES, LIST, MAP, NULL, NUMBER, NUMBER_SET,
+                                    QUERY_OPERATORS, STRING, STRING_SET)
+
+from dynamodb2_mapper.exceptions import (SchemaError, MaxRetriesExceededError,
+                                         ConflictError, OverwriteError, InvalidRegionError)
 log = logging.getLogger(__name__)
 dblog = logging.getLogger(__name__+".database-access")
 
 
 MAX_RETRIES = 100
-# primary key of the magic item used for autoinc
-MAGIC_KEY = -1
-
-class SchemaError(Exception):
-    """SchemaError exception is raised when a schema consistency check fails.
-    Most of the checks are performed in :py:meth:`~.ConnectionBorg.create_table`.
-
-    Common consistency failure includes lacks of ``__table__``, ``__hash_key__``,
-    ``__schema__`` definition or when an :py:class:`~.autoincrement_int` ``hash_key``
-    is used with a ``range_key``.
-    """
-
-
-class MaxRetriesExceededError(Exception):
-    """Raised when a failed operation couldn't be completed after retrying
-    ``MAX_RETRIES`` times (e.g. saving an autoincrementing hash_key).
-    """
-
-
-class ConflictError(Exception):
-    """Atomic edition failure.
-    Raised when an Item has been changed between the read and the write operation
-    and this has been forbid by the ``raise_on_conflict`` argument of
-    :meth:`DynamoDBModel.save` (i.e. when somebody changed the DB's version of
-    your object behind your back).
-    """
-
-
-class OverwriteError(ConflictError):
-    """Raised when saving a DynamoDBModel instance would overwrite something
-    in the database and we've forbidden that because we believe we're creating
-    a new one (see :meth:`DynamoDBModel.save`).
-    """
-
-
-class InvalidRegionError(Exception):
-    """Raised when ``set_region()`` is called with an invalid region name.
-    """
-
-
-class autoincrement_int(int):
-    """Dummy int subclass for use in your schemas.
-
-    If you're using this class as the type for your key in a hash_key-only
-    table, new objects in your table will have an auto-incrementing primary
-    key.
-
-    Note that you can still insert items with explicit values for your primary
-    key -- the autoincrementing scheme is only used for objects with unset
-    hash_keys (or to be more precise, left set to the default value of 0).
-
-    Auto-incrementing int keys are implemented by storing a special "magic"
-    item in the table with the following properties:
-
-        - ``hash_key_value = -1``
-        - ``__max_hash_key__ = N``
-
-    where N is the maximum used hash_key value.
-
-    Inserting a new item issues an atomic add on the '__max_hash_key__' value.
-    Its new value is returned and used as the primary key for the new elem.
-
-    Note that hash_key_value is set to '-1' while ``__max_hash_key__`` implicit
-    initial value is 0. This guarantees element at key '0' is unused. It's actually
-    a garbage item for cases where a value is manually added to an unitialized index.
-    """
-
-_JSON_TYPES = frozenset([list, dict])
-
 
 class UTC(tzinfo):
     """UTC timezone"""
@@ -114,7 +59,7 @@ def _get_proto_value(schema_entry):
         datetime), an empty string (this is what they're stored as in the DB).
     """
     # Those types must be serialized as strings
-    if schema_entry in _JSON_TYPES or type(schema_entry) in _JSON_TYPES:
+    if schema_entry in JSON_TYPES or type(schema_entry) in JSON_TYPES:
         return u""
 
     if schema_entry is datetime:
@@ -141,9 +86,9 @@ def _python_to_dynamodb(value):
     :return: ``value``, serialized to DynamoDB, or ``None`` if ``value`` must
         be represented as a missing attribute.
     """
-    if isinstance(value, tuple(_JSON_TYPES)):
+    if isinstance(value, tuple(JSON_TYPES)):
         # json serialization hooks for json_* data types.
-        return json.dumps(value, sort_keys=True)
+        return simplejson.dumps(value, sort_keys=True)
 
     if isinstance(value, datetime):
         # datetime instances are stored as UTC in the DB itself.
@@ -189,18 +134,18 @@ def _dynamodb_to_python(schema_entry, value):
     schema_type = type(schema_entry)
 
     # Handle json related type
-    if schema_type in _JSON_TYPES:
+    if schema_type in JSON_TYPES:
         # looks like a validator => load and validate it
         if value is None:
             value = schema_type()
         else:
-            value = schema_type(json.loads(value))
+            value = schema_type(simplejson.loads(value))
         return Schema(schema_entry)(value)
-    elif schema_entry in _JSON_TYPES:
+    elif schema_entry in JSON_TYPES:
         # basic type => just load it and return
         if value is None:
             return schema_entry()
-        return schema_entry(json.loads(value))
+        return schema_entry(simplejson.loads(value))
 
     # Handle this f** datetime sh** (sorry for expressing my thougts aloud)
     # if we enter this, it means this is not a validator so return directly
@@ -237,11 +182,11 @@ def _dynamodb_to_python(schema_entry, value):
 class ConnectionBorg(object):
     """Borg that handles access to DynamoDB.
 
-    You should never make any explicit/direct ``boto.dynamodb`` calls by yourself
+    You should never make any explicit/direct ``boto.dynamodb2.table.Table`` calls by yourself
     except for table maintenance operations :
 
-        - ``boto.dynamodb.table.update_throughput()``
-        - ``boto.dynamodb.table.delete()``
+        - ``boto.dynamodb2.table.Table.update()``
+        - ``boto.dynamodb2.table.Table.delete()``
 
     Remember to call :meth:`set_credentials`, or to set the
     ``AWS_ACCESS_KEY_ID`` and ``AWS_SECRET_ACCESS_KEY`` environment variables
@@ -250,7 +195,7 @@ class ConnectionBorg(object):
     _shared_state = {
         "_aws_access_key_id": None,
         "_aws_secret_access_key": None,
-        "_region": None,
+        "_region_name": None,
         "_connection": None,
         "_tables_cache": {},
     }
@@ -262,10 +207,10 @@ class ConnectionBorg(object):
         """Return the DynamoDB connection for the mapper
         """
         if self._connection is None:
-            self._connection = boto.connect_dynamodb(
+            self._connection = connect_dynamodb2(
                 aws_access_key_id=self._aws_access_key_id,
                 aws_secret_access_key=self._aws_secret_access_key,
-                region=self._region,
+                region_name=self._region_name
             )
         return self._connection
 
@@ -288,9 +233,9 @@ class ConnectionBorg(object):
 
         :param region_name: The name of the region to use
         """
-        for region in boto.dynamodb.regions():
+        for region in dynamodb2_regions():
             if region.name == region_name:
-                self._region = region
+                self._region_name = region.name
                 return
 
         raise InvalidRegionError("Region name %s is invalid" % region_name)
@@ -359,6 +304,7 @@ class ConnectionBorg(object):
             range_key_name=range_key_name,
             range_key_proto_value=range_key_proto_value
         )
+        table = Table.create()
         table = conn.create_table(cls.__table__, schema, read_units, write_units)
         table.refresh(wait_for_active=wait_for_active)
 
@@ -447,6 +393,8 @@ class DynamoDBModel(object):
     __schema__ = None
     __migrator__ = None
     __defaults__ = {}
+    __indexes__ = {}
+    __global_indexes__ = {}
 
     def __init__(self, **kwargs):
         """Create an instance of the model. All fields defined in the schema
@@ -891,7 +839,7 @@ class DynamoDBModel(object):
         try:
             table = ConnectionBorg().get_table(cls.__table__)
             Item(table, h_value, r_value).delete(expected_values)
-        except DynamoDBConditionalCheckFailedError, e:
+        except ConditionalCheckFailedError, e:
             raise ConflictError(e)
 
         # Make sure any further save will be considered as *insertion*
